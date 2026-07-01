@@ -30,6 +30,7 @@ import base64
 import asyncio
 import threading
 from pathlib import Path
+from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import discord
@@ -53,6 +54,20 @@ try:
     ORDERS_CHANNEL_ID = int(os.getenv("ORDERS_CHANNEL_ID", "0") or "0")
 except ValueError:
     ORDERS_CHANNEL_ID = 0
+
+# Daily stock summary: where to post it, what hour (UTC, 0-23), and the low threshold.
+try:
+    SUMMARY_CHANNEL_ID = int(os.getenv("SUMMARY_CHANNEL_ID", "0") or "0")
+except ValueError:
+    SUMMARY_CHANNEL_ID = 0
+try:
+    SUMMARY_HOUR = max(0, min(23, int(os.getenv("SUMMARY_HOUR", "14") or "14")))
+except ValueError:
+    SUMMARY_HOUR = 14
+try:
+    LOW_THRESHOLD = int(os.getenv("LOW_THRESHOLD", "10") or "10")
+except ValueError:
+    LOW_THRESHOLD = 10
 
 if not DISCORD_TOKEN:
     raise SystemExit("Missing DISCORD_BOT_TOKEN in .env")
@@ -244,6 +259,51 @@ def effective_stock(data: dict) -> dict:
     return {n: max(v, 0) for n, v in agg.items()}
 
 
+def build_summary(data: dict) -> str:
+    """A stock health report: out-of-stock, low, healthy counts, and sold total."""
+    stock = effective_stock(data)
+    out = {n: q for n, q in stock.items() if q <= 0}
+    low = {n: q for n, q in stock.items() if 0 < q <= LOW_THRESHOLD}
+    healthy = {n: q for n, q in stock.items() if q > LOW_THRESHOLD}
+    sold = sum(data.get("deductions", {}).values())
+    today = datetime.now(timezone.utc).strftime("%b %d, %Y")
+
+    parts = [f"📊 **Daily Stock Summary — {today}**"]
+    if out:
+        parts.append("🔴 **Out of stock:** " + ", ".join(
+            f"{item_emoji(n)} {n}" for n in sorted(out)))
+    if low:
+        parts.append(f"🟡 **Low (≤ {LOW_THRESHOLD}):**\n" + "\n".join(
+            f"{item_emoji(n)} {n} — **{q}**" for n, q in sorted(low.items())))
+    if not out and not low:
+        parts.append(f"🟢 Everything is above {LOW_THRESHOLD}. Stock looks healthy.")
+    parts.append(
+        f"\n_{len(healthy)} items healthy · {len(low)} low · {len(out)} out · "
+        f"{sold} sold since last recount._"
+    )
+    return "\n".join(parts)
+
+
+_summary_started = False
+
+
+async def daily_summary_loop():
+    """Post build_summary() to SUMMARY_CHANNEL_ID once a day at SUMMARY_HOUR (UTC)."""
+    await client.wait_until_ready()
+    while not client.is_closed():
+        now = datetime.now(timezone.utc)
+        target = now.replace(hour=SUMMARY_HOUR, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep(max(1.0, (target - now).total_seconds()))
+        try:
+            channel = client.get_channel(SUMMARY_CHANNEL_ID)
+            if channel is not None:
+                await channel.send(build_summary(_load()))
+        except Exception as e:  # noqa: BLE001
+            print(f"[summary] failed: {e}", flush=True)
+
+
 # ---------------------------------------------------------------------------
 # Discord bot
 # ---------------------------------------------------------------------------
@@ -378,6 +438,11 @@ async def on_ready():
         print(f"[emoji] setup skipped: {e}", flush=True)
     if ORDERS_CHANNEL_ID:
         print(f"Watching orders channel {ORDERS_CHANNEL_ID} for stock deductions.")
+    global _summary_started
+    if SUMMARY_CHANNEL_ID and not _summary_started:
+        _summary_started = True
+        client.loop.create_task(daily_summary_loop())
+        print(f"Daily summary scheduled for {SUMMARY_HOUR:02d}:00 UTC in channel {SUMMARY_CHANNEL_ID}.")
     print("Ready. Post an inventory screenshot to track it.")
 
 
@@ -593,6 +658,10 @@ async def handle_command(message: discord.Message, content: str):
         )
         return
 
+    if cmd == "!summary":
+        await message.reply(build_summary(_load()))
+        return
+
     if cmd == "!sold":
         # Items deducted by fulfilled orders since the last recount.
         data = _load()
@@ -756,6 +825,7 @@ HELP_TEXT = (
     "`!stock` — total stock combined (minus fulfilled orders)\n"
     "`!low [n]` — stock at or below n (default 10)\n"
     "`!find <item>` — who has an item\n"
+    "`!summary` — stock health report (out/low/healthy)\n"
     "`!sold` — items sold since the last recount\n"
     "`!recount` — reset stock for a fresh inventory check\n"
     "`!set <account|stock> <qty> <item>` — set/correct a quantity (uses your name)\n"
