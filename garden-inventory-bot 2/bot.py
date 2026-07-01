@@ -64,7 +64,13 @@ IGNORE_ITEMS = _DEFAULT_IGNORE | {
     i.strip().lower() for i in os.getenv("IGNORE_ITEMS", "").split(",") if i.strip()
 }
 
-anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+# max_retries lets the SDK automatically retry transient connection errors,
+# timeouts, and rate limits with backoff; timeout guards against big images.
+anthropic_client = anthropic.Anthropic(
+    api_key=ANTHROPIC_API_KEY,
+    max_retries=4,
+    timeout=90.0,
+)
 
 # ---------------------------------------------------------------------------
 # Storage helpers
@@ -232,7 +238,10 @@ async def on_message(message: discord.Message):
             try:
                 items = await read_inventory_from_image(data, media_type)
             except Exception as exc:  # noqa: BLE001
-                await message.reply(f"⚠️ Couldn't read that image: {exc}")
+                await message.reply(
+                    f"⚠️ Couldn't read that image ({type(exc).__name__}): {exc}. "
+                    "It'll retry automatically next time — try posting again."
+                )
                 continue
             for name, qty in items.items():
                 added_total[name] = added_total.get(name, 0) + qty
