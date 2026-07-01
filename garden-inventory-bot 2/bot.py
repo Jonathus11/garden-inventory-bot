@@ -221,7 +221,7 @@ async def read_inventory_from_images(images: list):
         except (TypeError, ValueError):
             qty = 1
         result[name] = result.get(name, 0) + max(qty, 0)
-    return username, result
+    return username, result, text
 
 
 ORDER_PROMPT = (
@@ -525,8 +525,23 @@ async def on_message(message: discord.Message):
             if mt not in ("image/png", "image/jpeg", "image/webp", "image/gif"):
                 mt = "image/png"
             payload.append((raw, mt))
+        raw_text = ""
         try:
-            game_username, added_total = await read_inventory_from_images(payload)
+            game_username, added_total, raw_text = await read_inventory_from_images(payload)
+            # Fallback: if reading them together found nothing, read each one on its
+            # own and merge (max per item, so a repeated hotbar isn't double-counted).
+            if not added_total and len(payload) > 1:
+                merged: dict[str, int] = {}
+                for one in payload:
+                    try:
+                        u, items, _t = await read_inventory_from_images([one])
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if u and not game_username:
+                        game_username = u
+                    for n, q in items.items():
+                        merged[n] = max(merged.get(n, 0), q)
+                added_total = merged
         except Exception as exc:  # noqa: BLE001
             # Log full detail to the private server logs only. NEVER echo raw error
             # text to Discord — it can contain secrets like API keys.
@@ -545,9 +560,13 @@ async def on_message(message: discord.Message):
             return
 
     if not added_total:
+        print(f"[no items] model said: {raw_text[:500]!r}", flush=True)
+        snippet = (raw_text or "").strip()[:280]
+        extra = f"\nModel returned:\n```{snippet}```" if snippet else ""
         await message.reply(
-            "I couldn't read any items from that screenshot. "
-            "Try a clearer/cropped image, or use `!set` to add items manually."
+            "I couldn't read any items. Tips: post screenshots with the **inventory "
+            "open** (not the field view), and keep it to a few clear shots. "
+            f"Or use `!set` to add items manually.{extra}"
         )
         return
 
@@ -603,7 +622,7 @@ async def handle_order(message: discord.Message):
             if mt not in ("image/png", "image/jpeg", "image/webp", "image/gif"):
                 mt = "image/png"
             try:
-                _u, items = await read_inventory_from_images([(raw, mt)])
+                _u, items, _t = await read_inventory_from_images([(raw, mt)])
                 for n, q in items.items():
                     ordered[n] = ordered.get(n, 0) + q
             except Exception as e:  # noqa: BLE001
