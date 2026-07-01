@@ -133,6 +133,30 @@ def normalize_item(name: str) -> str:
     return re.sub(r"\s+", " ", name.strip().lower())
 
 
+_ITEM_RE = re.compile(r'"name"\s*:\s*"([^"]+)"\s*,\s*"qty"\s*:\s*(-?\d+)')
+_USER_RE = re.compile(r'"username"\s*:\s*"([^"]*)"')
+
+
+def _parse_items_json(text: str):
+    """Return (username, [{'name','qty'}, ...]) from a model reply.
+    Tries strict JSON first; if the reply was truncated/malformed, salvages
+    every name/qty pair with a regex so big inventories still come through."""
+    match = re.search(r"\{.*\}", text, re.DOTALL)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            return (
+                str(parsed.get("username", "") or "").strip(),
+                parsed.get("items", []) or [],
+            )
+        except json.JSONDecodeError:
+            pass
+    uname_m = _USER_RE.search(text)
+    uname = uname_m.group(1).strip() if uname_m else ""
+    entries = [{"name": n, "qty": q} for n, q in _ITEM_RE.findall(text)]
+    return uname, entries
+
+
 # ---------------------------------------------------------------------------
 # Vision: read an inventory screenshot into {item: qty}
 # ---------------------------------------------------------------------------
@@ -163,7 +187,7 @@ async def read_inventory_from_image(image_bytes: bytes, media_type: str):
     def _call():
         return anthropic_client.messages.create(
             model=VISION_MODEL,
-            max_tokens=1500,
+            max_tokens=8000,  # full inventories can have many items — don't truncate
             messages=[
                 {
                     "role": "user",
@@ -185,19 +209,9 @@ async def read_inventory_from_image(image_bytes: bytes, media_type: str):
     resp = await asyncio.to_thread(_call)
     text = "".join(block.text for block in resp.content if block.type == "text")
 
-    # Pull the first {...} JSON object out of the response defensively.
-    match = re.search(r"\{.*\}", text, re.DOTALL)
-    if not match:
-        return "", {}
-    try:
-        parsed = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return "", {}
-
-    username = str(parsed.get("username", "") or "").strip()
-
+    username, entries = _parse_items_json(text)
     result: dict[str, int] = {}
-    for entry in parsed.get("items", []):
+    for entry in entries:
         name = normalize_item(str(entry.get("name", "")))
         if not name or name in IGNORE_ITEMS:
             continue
@@ -222,21 +236,15 @@ async def parse_order_text(text: str) -> dict:
     def _call():
         return anthropic_client.messages.create(
             model=VISION_MODEL,
-            max_tokens=800,
+            max_tokens=2000,
             messages=[{"role": "user", "content": f"{ORDER_PROMPT}\n\nORDER:\n{text}"}],
         )
 
     resp = await asyncio.to_thread(_call)
     out = "".join(b.text for b in resp.content if b.type == "text")
-    match = re.search(r"\{.*\}", out, re.DOTALL)
-    if not match:
-        return {}
-    try:
-        parsed = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return {}
+    _u, entries = _parse_items_json(out)
     result: dict[str, int] = {}
-    for entry in parsed.get("items", []):
+    for entry in entries:
         name = normalize_item(str(entry.get("name", "")))
         if not name or name in IGNORE_ITEMS:
             continue
@@ -317,6 +325,28 @@ def detect_kind(text: str) -> str:
     if "store" in low or "stock" in low:
         return "store"
     return "account"  # default
+
+
+# Roles (by name, case-insensitive) that may use the bot, in addition to anyone
+# with Administrator/Manage-Server permission or the server owner. Configure with
+# the ADMIN_ROLES env var, e.g. "admin,staff,owner,manager".
+_ADMIN_ROLE_NAMES = {
+    n.strip().lower()
+    for n in os.getenv("ADMIN_ROLES", "admin,staff,owner,mod,manager").split(",")
+    if n.strip()
+}
+
+
+def is_admin(message: discord.Message) -> bool:
+    author = message.author
+    perms = getattr(author, "guild_permissions", None)
+    if perms and (perms.administrator or perms.manage_guild):
+        return True
+    guild = getattr(message, "guild", None)
+    if guild and getattr(guild, "owner_id", None) == author.id:
+        return True
+    role_names = {r.name.lower() for r in getattr(author, "roles", [])}
+    return bool(role_names & _ADMIN_ROLE_NAMES)
 
 
 # Item -> emoji. Matched by substring (first hit wins), so "black dragon" and
@@ -455,12 +485,19 @@ async def on_message(message: discord.Message):
 
     # --- Commands -----------------------------------------------------------
     if content.startswith("!"):
+        if content.lower() in ("!help", "!commands"):
+            await handle_command(message, content)
+            return
+        if not is_admin(message):
+            await message.reply("🔒 Only admins/staff can use the inventory bot.")
+            return
         await handle_command(message, content)
         return
 
-    # --- Fulfilled orders -> deduct from stock ------------------------------
+    # --- Fulfilled orders -> deduct from stock (staff only) -----------------
     if ORDERS_CHANNEL_ID and message.channel.id == ORDERS_CHANNEL_ID:
-        await handle_order(message)
+        if is_admin(message):
+            await handle_order(message)
         return
 
     # --- Image posts --------------------------------------------------------
@@ -470,6 +507,9 @@ async def on_message(message: discord.Message):
         or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
     ]
     if not images:
+        return
+    # Only staff can add inventory, so randoms can't pollute the data.
+    if not is_admin(message):
         return
 
     kind = detect_kind(content)
