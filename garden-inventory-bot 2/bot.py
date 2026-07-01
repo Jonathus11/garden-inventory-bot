@@ -196,15 +196,58 @@ client = discord.Client(intents=intents)
 
 def detect_kind(text: str) -> str:
     low = text.lower()
-    if "store" in low:
+    if "store" in low or "stock" in low:
         return "store"
     return "account"  # default
+
+
+# Item -> emoji. Matched by substring (first hit wins), so "black dragon" and
+# "dragon breath" both catch "dragon". Order matters: put specific before general.
+_EMOJI_RULES = [
+    ("ice serpent", "🐍"), ("serpent", "🐍"), ("venom", "🐍"), ("spitter", "🐍"),
+    ("black dragon", "🐲"), ("dragon breath", "🌶️"), ("dragfly", "🪰"),
+    ("dragonfly", "🪰"), ("dragon", "🐉"),
+    ("ghost pepper", "👻"), ("pepper", "🌶️"),
+    ("hypno", "🌀"), ("moon bloom", "🌙"), ("moon", "🌙"), ("bloom", "🌸"),
+    ("venus", "🪤"), ("fly trap", "🪤"),
+    ("rainbow", "🌈"), ("gold", "🪙"), ("mega", "💥"),
+    ("super sprinkler", "💦"), ("legendary sprinkler", "💦"), ("sprinkler", "💦"),
+    ("watering", "🚿"), ("can", "🚿"),
+    ("raccoon", "🦝"), ("racoon", "🦝"), ("unicorn", "🦄"), ("bear", "🐻"),
+    ("monkey", "🐵"), ("robin", "🐦"), ("owl", "🦉"), ("bee", "🐝"),
+    ("deer", "🦌"), ("frog", "🐸"), ("bunny", "🐰"), ("cactus", "🌵"),
+    ("corn", "🌽"), ("banana", "🍌"), ("cherry", "🍒"), ("grape", "🍇"),
+    ("mango", "🥭"), ("coconut", "🥥"), ("acorn", "🌰"), ("pineapple", "🍍"),
+    ("pomegranate", "🍎"), ("mushroom", "🍄"), ("sunflower", "🌻"),
+    ("seed", "🌱"),
+]
+
+
+def item_emoji(name: str) -> str:
+    low = name.lower()
+    for key, emo in _EMOJI_RULES:
+        if key in low:
+            return emo
+    return "📦"
+
+
+async def _send_chunks(message, header: str, blocks: list) -> None:
+    """Send blocks joined under a header, splitting to respect Discord's 2000 cap."""
+    chunk = header
+    for block in blocks:
+        piece = block + "\n\n"
+        if len(chunk) + len(piece) > 1900:
+            await message.reply(chunk.rstrip())
+            chunk = ""
+        chunk += piece
+    if chunk.strip():
+        await message.reply(chunk.rstrip())
 
 
 def fmt_inventory(inv: dict) -> str:
     if not inv:
         return "_(empty)_"
-    lines = [f"• {name} — {qty}" for name, qty in sorted(inv.items())]
+    lines = [f"{item_emoji(name)} {name} — **{qty}**" for name, qty in sorted(inv.items())]
     return "\n".join(lines)
 
 
@@ -297,6 +340,16 @@ async def on_message(message: discord.Message):
     )
 
 
+def _norm_kind(token: str) -> str:
+    """Map a user-typed kind token to a bucket name; 'stock' -> 'store'."""
+    t = token.lower()
+    if t in ("store", "stock"):
+        return "store"
+    if t == "account":
+        return "account"
+    return ""
+
+
 async def handle_command(message: discord.Message, content: str):
     parts = content.split()
     cmd = parts[0].lower()
@@ -306,41 +359,110 @@ async def handle_command(message: discord.Message, content: str):
         await message.reply(HELP_TEXT)
         return
 
-    if cmd == "!inv":
-        # !inv [@user] [account|store]
-        target = message.author.display_name
-        if message.mentions:
-            target = message.mentions[0].display_name
-        kind = "account"
-        for a in args:
-            if a.lower() in VALID_KINDS:
-                kind = a.lower()
+    if cmd in ("!inv", "!accountslist"):
+        # !inv                       -> list every tracked account
+        # !inv <name> [account|store] -> show that account's inventory
         data = _load()
+        kind = "account"
+        name_args = []
+        for a in args:
+            if a.lower() in VALID_KINDS or a.lower() == "stock":
+                kind = "store" if a.lower() in ("store", "stock") else "account"
+            else:
+                name_args.append(a)
+
+        # No account name given -> list all tracked accounts.
+        if not name_args and not message.mentions:
+            names = sorted(data["users"].keys())
+            if not names:
+                await message.reply("No accounts tracked yet. Post an inventory screenshot to start.")
+            else:
+                listing = "\n".join(f"• {n}" for n in names)
+                await message.reply(
+                    f"**Tracked accounts ({len(names)}):**\n{listing}\n"
+                    "Use `!inv <name> [account|store]` to see one."
+                )
+            return
+
+        target = message.mentions[0].display_name if message.mentions else " ".join(name_args)
+        # Case-insensitive match against tracked game usernames.
         user = data["users"].get(target)
+        if user is None:
+            for k in data["users"]:
+                if k.lower() == target.lower():
+                    target, user = k, data["users"][k]
+                    break
         if not user:
             await message.reply(f"No inventory tracked for **{target}** yet.")
             return
-        inv = user.get(kind, {})
+        label = "stock" if kind == "store" else "account"
         await message.reply(
-            f"**{target}** — {kind} inventory:\n{fmt_inventory(inv)}"
+            f"**{target}** — {label}:\n{fmt_inventory(user.get(kind, {}))}"
         )
         return
 
-    if cmd in ("!store", "!accounts"):
-        kind = "store" if cmd == "!store" else "account"
+    if cmd in ("!store", "!stock"):
+        # Everything combined across all accounts.
         data = _load()
         agg: dict[str, int] = {}
         for user in data["users"].values():
-            for name, qty in user.get(kind, {}).items():
+            for name, qty in user.get("store", {}).items():
                 agg[name] = agg.get(name, 0) + qty
         await message.reply(
-            f"**Aggregate {kind} inventory (everyone):**\n{fmt_inventory(agg)}"
+            f"**📦 Total stock (everyone combined):**\n{fmt_inventory(agg)}"
         )
         return
 
-    if cmd == "!who":
+    if cmd == "!accounts":
+        # Each account and the items it holds.
+        data = _load()
+        users = data["users"]
+        if not users:
+            await message.reply("No accounts tracked yet. Post an inventory screenshot to start.")
+            return
+        blocks = []
+        for name in sorted(users, key=str.lower):
+            u = users[name]
+            acct = u.get("account", {})
+            stock = u.get("store", {})
+            lines = [f"__**{name}**__"]
+            if acct:
+                lines.append("• " + ",  ".join(
+                    f"{item_emoji(n)} {n} ×{q}" for n, q in sorted(acct.items())))
+            if stock:
+                lines.append("• _stock:_ " + ",  ".join(
+                    f"{item_emoji(n)} {n} ×{q}" for n, q in sorted(stock.items())))
+            if not acct and not stock:
+                lines.append("_(empty)_")
+            blocks.append("\n".join(lines))
+        # Discord has a 2000-char message cap; send in chunks if needed.
+        header = f"**👥 Accounts ({len(users)}):**\n"
+        await _send_chunks(message, header, blocks)
+        return
+
+    if cmd == "!low":
+        # !low [threshold]  -> stock items at or below threshold (default 10)
+        try:
+            threshold = int(args[0]) if args else 10
+        except ValueError:
+            threshold = 10
+        data = _load()
+        agg: dict[str, int] = {}
+        for user in data["users"].values():
+            for name, qty in user.get("store", {}).items():
+                agg[name] = agg.get(name, 0) + qty
+        low = {n: q for n, q in agg.items() if q <= threshold}
+        if not low:
+            await message.reply(f"✅ Nothing at or below {threshold} in stock.")
+        else:
+            await message.reply(
+                f"⚠️ **Low stock (≤ {threshold}):**\n{fmt_inventory(low)}"
+            )
+        return
+
+    if cmd in ("!who", "!find"):
         if not args:
-            await message.reply("Usage: `!who <item name>`")
+            await message.reply("Usage: `!find <item name>`")
             return
         query = normalize_item(" ".join(args))
         data = _load()
@@ -357,11 +479,11 @@ async def handle_command(message: discord.Message, content: str):
         return
 
     if cmd == "!set":
-        # !set <account|store> <qty> <item name...>
-        if len(args) < 3 or args[0].lower() not in VALID_KINDS:
-            await message.reply("Usage: `!set <account|store> <qty> <item name>`")
+        # !set <account|stock> <qty> <item name...>  (also accepts a leading @name/name)
+        kind = _norm_kind(args[0]) if args else ""
+        if len(args) < 3 or not kind:
+            await message.reply("Usage: `!set <account|stock> <qty> <item name>`")
             return
-        kind = args[0].lower()
         try:
             qty = int(args[1])
         except ValueError:
@@ -374,15 +496,15 @@ async def handle_command(message: discord.Message, content: str):
             bucket = _user_bucket(data, username, kind)
             bucket[name] = qty
             _save(data)
-        await message.reply(f"✅ Set **{username}** {kind}: {name} = {qty}")
+        await message.reply(f"✅ Set **{username}** {kind}: {item_emoji(name)} {name} = {qty}")
         return
 
     if cmd == "!remove":
-        # !remove <account|store> <item name...>
-        if len(args) < 2 or args[0].lower() not in VALID_KINDS:
-            await message.reply("Usage: `!remove <account|store> <item name>`")
+        # !remove <account|stock> <item name...>
+        kind = _norm_kind(args[0]) if args else ""
+        if len(args) < 2 or not kind:
+            await message.reply("Usage: `!remove <account|stock> <item name>`")
             return
-        kind = args[0].lower()
         name = normalize_item(" ".join(args[1:]))
         username = message.author.display_name
         async with _lock:
@@ -397,10 +519,10 @@ async def handle_command(message: discord.Message, content: str):
         return
 
     if cmd == "!clear":
-        if not args or args[0].lower() not in VALID_KINDS:
-            await message.reply("Usage: `!clear <account|store>`")
+        kind = _norm_kind(args[0]) if args else ""
+        if not kind:
+            await message.reply("Usage: `!clear <account|stock>`")
             return
-        kind = args[0].lower()
         username = message.author.display_name
         async with _lock:
             data = _load()
@@ -416,16 +538,19 @@ async def handle_command(message: discord.Message, content: str):
 
 HELP_TEXT = (
     "**Grow a Garden 2 Inventory Bot**\n"
-    "Post an inventory screenshot (add the word `store` to file it under the store "
-    "inventory; otherwise it goes to your account inventory). I'll read it with AI vision.\n\n"
+    "Post an inventory screenshot — I read the in-game username off the leaderboard "
+    "and the items with AI vision. Add the word `stock` (or `store`) in the message to "
+    "file it as sellable stock; otherwise it's tracked as that account's inventory.\n\n"
     "**Commands**\n"
-    "`!inv [@user] [account|store]` — show an inventory\n"
+    "`!inv` — list every tracked account\n"
+    "`!inv <name> [account|stock]` — show one account's inventory\n"
     "`!accounts` — everyone's account items, combined\n"
-    "`!store` — everyone's store items, combined\n"
-    "`!who <item>` — who has an item\n"
-    "`!set <account|store> <qty> <item>` — set/correct a quantity\n"
-    "`!remove <account|store> <item>` — remove an item\n"
-    "`!clear <account|store>` — wipe your own inventory\n"
+    "`!stock` — everyone's stock, combined\n"
+    "`!low [n]` — stock at or below n (default 10)\n"
+    "`!find <item>` — who has an item\n"
+    "`!set <account|stock> <qty> <item>` — set/correct a quantity (uses your name)\n"
+    "`!remove <account|stock> <item>` — remove an item\n"
+    "`!clear <account|stock>` — wipe your own inventory\n"
 )
 
 
