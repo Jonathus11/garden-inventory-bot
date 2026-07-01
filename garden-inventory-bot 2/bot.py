@@ -46,6 +46,14 @@ DISCORD_TOKEN = (os.getenv("DISCORD_BOT_TOKEN") or "").strip()
 ANTHROPIC_API_KEY = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
 VISION_MODEL = os.getenv("VISION_MODEL", "claude-sonnet-5")
 
+# Optional: a channel where fulfilled orders are posted. Messages there are parsed
+# and deducted from total stock. Right-click the channel in Discord (Developer Mode
+# on) -> Copy Channel ID, and set it as ORDERS_CHANNEL_ID in Railway.
+try:
+    ORDERS_CHANNEL_ID = int(os.getenv("ORDERS_CHANNEL_ID", "0") or "0")
+except ValueError:
+    ORDERS_CHANNEL_ID = 0
+
 if not DISCORD_TOKEN:
     raise SystemExit("Missing DISCORD_BOT_TOKEN in .env")
 if not ANTHROPIC_API_KEY:
@@ -186,6 +194,56 @@ async def read_inventory_from_image(image_bytes: bytes, media_type: str):
     return username, result
 
 
+ORDER_PROMPT = (
+    "Extract the items and quantities being ordered/sold from this text. Ignore "
+    "prices, dollar amounts, currency, totals, and words like 'total'. Return STRICT "
+    "JSON only: {\"items\": [{\"name\": \"moon bloom\", \"qty\": 50}]}. Lowercase names. "
+    "If a line says e.g. '50 moon bloom-17.5$' that is qty 50 of moon bloom."
+)
+
+
+async def parse_order_text(text: str) -> dict:
+    """Use the model to pull {item: qty} out of a messy order message."""
+    def _call():
+        return anthropic_client.messages.create(
+            model=VISION_MODEL,
+            max_tokens=800,
+            messages=[{"role": "user", "content": f"{ORDER_PROMPT}\n\nORDER:\n{text}"}],
+        )
+
+    resp = await asyncio.to_thread(_call)
+    out = "".join(b.text for b in resp.content if b.type == "text")
+    match = re.search(r"\{.*\}", out, re.DOTALL)
+    if not match:
+        return {}
+    try:
+        parsed = json.loads(match.group(0))
+    except json.JSONDecodeError:
+        return {}
+    result: dict[str, int] = {}
+    for entry in parsed.get("items", []):
+        name = normalize_item(str(entry.get("name", "")))
+        if not name or name in IGNORE_ITEMS:
+            continue
+        try:
+            qty = int(entry.get("qty", 1))
+        except (TypeError, ValueError):
+            qty = 1
+        result[name] = result.get(name, 0) + max(qty, 0)
+    return result
+
+
+def effective_stock(data: dict) -> dict:
+    """Total store stock across all accounts, minus fulfilled-order deductions."""
+    agg: dict[str, int] = {}
+    for user in data["users"].values():
+        for name, qty in user.get("store", {}).items():
+            agg[name] = agg.get(name, 0) + qty
+    for name, qty in data.get("deductions", {}).items():
+        agg[name] = agg.get(name, 0) - qty
+    return {n: max(v, 0) for n, v in agg.items()}
+
+
 # ---------------------------------------------------------------------------
 # Discord bot
 # ---------------------------------------------------------------------------
@@ -223,12 +281,72 @@ _EMOJI_RULES = [
 ]
 
 
+# Custom (picture) emojis built from the shop art in ./emojis. Keyword -> emoji
+# file/name (without .png). Specific multi-word keys first so "black dragon" and
+# "dragon breath" don't collide with a generic "dragon".
+EMOJI_DIR = Path(__file__).with_name("emojis")
+_CUSTOM_ITEMS = [
+    ("black dragon", "black_dragon"), ("ice serpent", "ice_serpent"),
+    ("dragon breath", "dragon_breath"), ("dragon fruit", "dragon_fruit"),
+    ("ghost pepper", "ghost_pepper"), ("hypno", "hypno_bloom"),
+    ("venom", "venom_spitter"), ("spitter", "venom_spitter"),
+    ("venus", "venus_fly_trap"), ("fly trap", "venus_fly_trap"),
+    ("dragfly", "dragonfly"), ("dragonfly", "dragonfly"),
+    ("gold seed", "gold_seed"), ("gold", "gold_seed"),
+    ("mega seed", "mega_seed"), ("mega", "mega_seed"),
+    ("watering", "watering_can"), ("sheckle", "sheckles"),
+    ("raccoon", "raccoon"), ("racoon", "raccoon"),
+    ("unicorn", "unicorn"), ("bear", "bear"), ("robin", "robin"),
+    ("owl", "owl"), ("bee", "bee"), ("deer", "deer"), ("frog", "frog"),
+    ("bunny", "bunny"), ("cactus", "cactus"), ("corn", "corn"),
+    ("banana", "banana"), ("cherry", "cherry"), ("grape", "grape"),
+    ("mango", "mango"), ("coconut", "coconut"), ("acorn", "acorn"),
+    ("pineapple", "pineapple"), ("pomegranate", "pomegranate"),
+    ("mushroom", "mushroom"), ("sunflower", "sunflower"),
+    ("green bean", "greenbean"), ("greenbean", "greenbean"),
+]
+# Filled at startup: emoji_name -> "<:name:id>" markdown once uploaded to a guild.
+_custom_resolved: dict[str, str] = {}
+
+
 def item_emoji(name: str) -> str:
     low = name.lower()
+    # Prefer a real picture emoji if we have one uploaded.
+    for key, ename in _CUSTOM_ITEMS:
+        if key in low and ename in _custom_resolved:
+            return _custom_resolved[ename]
     for key, emo in _EMOJI_RULES:
         if key in low:
             return emo
     return "📦"
+
+
+async def ensure_emojis():
+    """Upload bundled item pictures as custom server emojis (once), then map them.
+    Needs the 'Manage Expressions' permission; if missing, we silently fall back
+    to unicode emojis."""
+    if not EMOJI_DIR.is_dir():
+        return
+    files = sorted(EMOJI_DIR.glob("*.png"))
+    for guild in client.guilds:
+        existing = {e.name: e for e in guild.emojis}
+        for f in files:
+            ename = f.stem
+            if ename in existing:
+                _custom_resolved.setdefault(ename, str(existing[ename]))
+                continue
+            if len(guild.emojis) >= getattr(guild, "emoji_limit", 50):
+                continue  # server is full; leave the rest on unicode
+            try:
+                created = await guild.create_custom_emoji(name=ename, image=f.read_bytes())
+                _custom_resolved.setdefault(ename, str(created))
+                existing[ename] = created
+            except discord.Forbidden:
+                print("[emoji] Missing 'Manage Expressions' permission — using unicode.", flush=True)
+                break
+            except Exception as e:  # noqa: BLE001
+                print(f"[emoji] failed to upload {ename}: {e}", flush=True)
+    print(f"[emoji] {len(_custom_resolved)} custom item emojis ready.", flush=True)
 
 
 async def _send_chunks(message, header: str, blocks: list) -> None:
@@ -254,6 +372,12 @@ def fmt_inventory(inv: dict) -> str:
 @client.event
 async def on_ready():
     print(f"Logged in as {client.user} (id: {client.user.id})")
+    try:
+        await ensure_emojis()
+    except Exception as e:  # noqa: BLE001
+        print(f"[emoji] setup skipped: {e}", flush=True)
+    if ORDERS_CHANNEL_ID:
+        print(f"Watching orders channel {ORDERS_CHANNEL_ID} for stock deductions.")
     print("Ready. Post an inventory screenshot to track it.")
 
 
@@ -267,6 +391,11 @@ async def on_message(message: discord.Message):
     # --- Commands -----------------------------------------------------------
     if content.startswith("!"):
         await handle_command(message, content)
+        return
+
+    # --- Fulfilled orders -> deduct from stock ------------------------------
+    if ORDERS_CHANNEL_ID and message.channel.id == ORDERS_CHANNEL_ID:
+        await handle_order(message)
         return
 
     # --- Image posts --------------------------------------------------------
@@ -340,6 +469,58 @@ async def on_message(message: discord.Message):
     )
 
 
+async def handle_order(message: discord.Message):
+    """A message in the orders channel = a fulfilled order. Parse its items
+    (from text and/or screenshots) and deduct them from total stock."""
+    images = [
+        a for a in message.attachments
+        if (a.content_type or "").startswith("image/")
+        or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
+    ]
+    ordered: dict[str, int] = {}
+
+    async with message.channel.typing():
+        # Text part of the order.
+        text = message.content.strip()
+        if text:
+            try:
+                for n, q in (await parse_order_text(text)).items():
+                    ordered[n] = ordered.get(n, 0) + q
+            except Exception as e:  # noqa: BLE001
+                print(f"[order text error] {e}", flush=True)
+        # Image part(s) of the order.
+        for att in images:
+            raw = await att.read()
+            mt = att.content_type or "image/png"
+            if mt not in ("image/png", "image/jpeg", "image/webp", "image/gif"):
+                mt = "image/png"
+            try:
+                _u, items = await read_inventory_from_image(raw, mt)
+                for n, q in items.items():
+                    ordered[n] = ordered.get(n, 0) + q
+            except Exception as e:  # noqa: BLE001
+                print(f"[order image error] {e}", flush=True)
+
+    if not ordered:
+        await message.add_reaction("❓")
+        return
+
+    async with _lock:
+        data = _load()
+        ded = data.setdefault("deductions", {})
+        for n, q in ordered.items():
+            ded[n] = ded.get(n, 0) + q
+        _save(data)
+        remaining = effective_stock(data)
+
+    lines = []
+    for n, q in sorted(ordered.items()):
+        left = remaining.get(n, 0)
+        flag = "  ⚠️ **OUT**" if left <= 0 else (f"  ⚠️ low" if left <= 10 else "")
+        lines.append(f"{item_emoji(n)} {n} −{q}  →  {left} left{flag}")
+    await message.reply("🧾 **Order logged. Stock updated:**\n" + "\n".join(lines))
+
+
 def _norm_kind(token: str) -> str:
     """Map a user-typed kind token to a bucket name; 'stock' -> 'store'."""
     t = token.lower()
@@ -402,14 +583,41 @@ async def handle_command(message: discord.Message, content: str):
         return
 
     if cmd in ("!store", "!stock"):
-        # Everything combined across all accounts.
+        # Everything combined across all accounts, minus fulfilled orders.
         data = _load()
-        agg: dict[str, int] = {}
-        for user in data["users"].values():
-            for name, qty in user.get("store", {}).items():
-                agg[name] = agg.get(name, 0) + qty
+        stock = effective_stock(data)
+        sold = sum(data.get("deductions", {}).values())
+        note = f"\n_({sold} items sold since last recount — `!sold` for details)_" if sold else ""
         await message.reply(
-            f"**📦 Total stock (everyone combined):**\n{fmt_inventory(agg)}"
+            f"**📦 Total stock (everyone combined):**\n{fmt_inventory(stock)}{note}"
+        )
+        return
+
+    if cmd == "!sold":
+        # Items deducted by fulfilled orders since the last recount.
+        data = _load()
+        ded = data.get("deductions", {})
+        if not ded:
+            await message.reply("No orders logged since the last recount.")
+        else:
+            await message.reply(
+                "🧾 **Sold since last recount:**\n" + fmt_inventory(ded)
+            )
+        return
+
+    if cmd in ("!recount", "!resetstock"):
+        # Start a fresh inventory check: wipe all stock snapshots + the sold ledger,
+        # so the next round of stock screenshots becomes the new source of truth.
+        async with _lock:
+            data = _load()
+            for user in data["users"].values():
+                user["store"] = {}
+            data["deductions"] = {}
+            _save(data)
+        await message.reply(
+            "🔄 **Stock reset for a fresh inventory check.** Sold-counter zeroed and all "
+            "stock cleared. Now re-post each account's stock screenshots (include the word "
+            "`stock`), and orders will deduct from the new totals."
         )
         return
 
@@ -544,13 +752,17 @@ HELP_TEXT = (
     "**Commands**\n"
     "`!inv` — list every tracked account\n"
     "`!inv <name> [account|stock]` — show one account's inventory\n"
-    "`!accounts` — everyone's account items, combined\n"
-    "`!stock` — everyone's stock, combined\n"
+    "`!accounts` — each account and the items it holds\n"
+    "`!stock` — total stock combined (minus fulfilled orders)\n"
     "`!low [n]` — stock at or below n (default 10)\n"
     "`!find <item>` — who has an item\n"
+    "`!sold` — items sold since the last recount\n"
+    "`!recount` — reset stock for a fresh inventory check\n"
     "`!set <account|stock> <qty> <item>` — set/correct a quantity (uses your name)\n"
     "`!remove <account|stock> <item>` — remove an item\n"
-    "`!clear <account|stock>` — wipe your own inventory\n"
+    "`!clear <account|stock>` — wipe your own inventory\n\n"
+    "**Orders:** post fulfilled orders (text or screenshot) in the orders channel and "
+    "I'll deduct them from total stock automatically."
 )
 
 
