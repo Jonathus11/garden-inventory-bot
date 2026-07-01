@@ -94,12 +94,12 @@ IGNORE_ITEMS = _DEFAULT_IGNORE | {
     i.strip().lower() for i in os.getenv("IGNORE_ITEMS", "").split(",") if i.strip()
 }
 
-# max_retries lets the SDK automatically retry transient connection errors,
-# timeouts, and rate limits with backoff; timeout guards against big images.
+# max_retries retries transient connection errors; keep it low so a slow/failing
+# request can't hang for minutes (retries multiply the timeout). timeout is per try.
 anthropic_client = anthropic.Anthropic(
     api_key=ANTHROPIC_API_KEY,
-    max_retries=4,
-    timeout=90.0,
+    max_retries=2,
+    timeout=45.0,
 )
 
 # ---------------------------------------------------------------------------
@@ -588,15 +588,19 @@ async def on_message(message: discord.Message):
                 mt = "image/png"
             payload.append((raw, mt))
         raw_text = ""
+        game_username, added_total = "", {}
         try:
-            game_username, added_total, raw_text = await read_inventory_from_images(payload)
+            # Hard overall time budget so the bot never hangs on "typing" forever.
+            game_username, added_total, raw_text = await asyncio.wait_for(
+                read_inventory_from_images(payload), timeout=110)
             # Fallback: if reading them together found nothing, read each one on its
             # own and merge (max per item, so a repeated hotbar isn't double-counted).
             if not added_total and len(payload) > 1:
                 merged: dict[str, int] = {}
-                for one in payload:
+                for one in payload[:5]:  # bound the fallback work
                     try:
-                        u, items, _t = await read_inventory_from_images([one])
+                        u, items, _t = await asyncio.wait_for(
+                            read_inventory_from_images([one]), timeout=45)
                     except Exception:  # noqa: BLE001
                         continue
                     if u and not game_username:
@@ -604,6 +608,13 @@ async def on_message(message: discord.Message):
                     for n, q in items.items():
                         merged[n] = max(merged.get(n, 0), q)
                 added_total = merged
+        except asyncio.TimeoutError:
+            print("[vision timeout] request exceeded budget", flush=True)
+            await message.reply(
+                "⏱️ That took too long to read. Try posting **2–3 clear screenshots** "
+                "at a time instead of a big batch."
+            )
+            return
         except Exception as exc:  # noqa: BLE001
             # Log full detail to the private server logs only. NEVER echo raw error
             # text to Discord — it can contain secrets like API keys.
