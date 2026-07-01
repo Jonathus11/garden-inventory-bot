@@ -24,6 +24,7 @@ Data is stored in inventory.json next to this file.
 """
 
 import os
+import io
 import re
 import json
 import base64
@@ -37,6 +38,12 @@ import discord
 import aiohttp
 import anthropic
 from dotenv import load_dotenv
+
+try:
+    from PIL import Image  # optional: used to downscale big screenshots
+    _HAS_PIL = True
+except Exception:  # noqa: BLE001
+    _HAS_PIL = False
 
 # ---------------------------------------------------------------------------
 # Config
@@ -120,7 +127,10 @@ def _load() -> dict:
 
 
 def _save(data: dict) -> None:
-    DATA_FILE.write_text(json.dumps(data, indent=2, sort_keys=True))
+    # Write atomically so a crash/concurrent read can never see a half-written file.
+    tmp = DATA_FILE.with_suffix(DATA_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
+    os.replace(tmp, DATA_FILE)
 
 
 def _user_bucket(data: dict, username: str, kind: str) -> dict:
@@ -169,14 +179,20 @@ VISION_PROMPT = (
     "headed 'People' / 'Sheckles'), and the inventory panel title often reads \"<name>'s "
     "Inventory\". The current player's leaderboard row is highlighted (brighter/whiter). "
     "Return that username; if you truly cannot tell, return \"\".\n"
-    "2. The combined inventory items with quantities. Items appear in inventory panels and "
-    "in the hotbar along the bottom. Counting rules:\n"
+    "2. The combined inventory items with quantities. Items appear in TWO places and you "
+    "must read BOTH:\n"
+    "   (a) The INVENTORY PANEL grid (pets, crops, gears) when it is open.\n"
+    "   (b) The HOTBAR / quickbar along the very bottom of the screen — this is visible "
+    "even when no inventory panel is open. Each hotbar slot shows an item icon with a "
+    "small quantity like 'x369' or 'x766' printed on it, and a label under it (e.g. "
+    "'Super Watering Can', 'Rainbow Seed', 'Mega Seed', 'Dragon Breath Seed'). Read every "
+    "hotbar slot and its x-number. ALWAYS read the hotbar even if the inventory is closed.\n"
+    "Counting rules:\n"
     "   • If an item shows a stack number (xN), use that number.\n"
     "   • If the same stack-number item appears in more than one screenshot (e.g. the "
     "hotbar is visible in several), count it ONCE — do not add the duplicates.\n"
     "   • Items shown as individual icons without a number (like pets) count as 1 each; "
     "count every distinct icon across all screenshots.\n"
-    "   • For the hotbar, count each separate slot.\n"
     "Return exactly this shape:\n"
     '{"username": "StashlySpecial", "items": [{"name": "black dragon", "qty": 4}]}\n'
     "Rules: lowercase item names; if a quantity is unreadable use 1; ignore currency, "
@@ -185,11 +201,32 @@ VISION_PROMPT = (
 )
 
 
+def _prep_image(raw: bytes, media_type: str):
+    """Downscale big screenshots (long edge > 1568px, the model's own working size)
+    and re-encode as PNG. Keeps requests small/reliable. No-op without Pillow."""
+    if not _HAS_PIL:
+        return raw, media_type
+    try:
+        im = Image.open(io.BytesIO(raw))
+        im = im.convert("RGB")
+        long_edge = max(im.size)
+        if long_edge > 1568:
+            scale = 1568 / long_edge
+            im = im.resize((max(1, int(im.width * scale)), max(1, int(im.height * scale))),
+                           Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, "PNG", optimize=True)
+        return buf.getvalue(), "image/png"
+    except Exception:  # noqa: BLE001
+        return raw, media_type
+
+
 async def read_inventory_from_images(images: list):
     """images: list of (bytes, media_type). Sends them together so the model can
-    merge tabs/scrolls into ONE inventory. Returns (username, {item: qty})."""
+    merge tabs/scrolls into ONE inventory. Returns (username, {item: qty}, raw_text)."""
     content = []
     for raw, mt in images:
+        raw, mt = _prep_image(raw, mt)
         content.append({
             "type": "image",
             "source": {
@@ -446,11 +483,36 @@ async def _send_chunks(message, header: str, blocks: list) -> None:
     for block in blocks:
         piece = block + "\n\n"
         if len(chunk) + len(piece) > 1900:
-            await message.reply(chunk.rstrip())
+            await reply_long(message, chunk.rstrip())
             chunk = ""
         chunk += piece
     if chunk.strip():
-        await message.reply(chunk.rstrip())
+        await reply_long(message, chunk.rstrip())
+
+
+async def reply_long(message, text: str) -> None:
+    """Reply, splitting on line breaks so we never exceed Discord's 2000-char limit
+    (a big inventory could otherwise fail to send at all)."""
+    if not text:
+        return
+    if len(text) <= 1990:
+        await message.reply(text)
+        return
+    buf = ""
+    for line in text.split("\n"):
+        # A single very long line still has to be hard-split.
+        while len(line) > 1990:
+            if buf:
+                await message.reply(buf)
+                buf = ""
+            await message.reply(line[:1990])
+            line = line[1990:]
+        if len(buf) + len(line) + 1 > 1990:
+            await message.reply(buf)
+            buf = ""
+        buf += (line + "\n")
+    if buf.strip():
+        await message.reply(buf.rstrip())
 
 
 def fmt_inventory(inv: dict) -> str:
@@ -506,7 +568,7 @@ async def on_message(message: discord.Message):
         a for a in message.attachments
         if (a.content_type or "").startswith("image/")
         or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
-    ]
+    ][:8]  # cap to keep the vision request a sane size
     if not images:
         return
     # Only staff can add inventory, so randoms can't pollute the data.
@@ -589,7 +651,8 @@ async def on_message(message: discord.Message):
         _save(data)
 
     summary = fmt_inventory(added_total)
-    await message.reply(
+    await reply_long(
+        message,
         f"✅ Added to **{username}**'s **{kind}** inventory{read_note} "
         f"(posted by {message.author.display_name}):\n{summary}{from_note}"
     )
@@ -602,12 +665,16 @@ async def handle_order(message: discord.Message):
         a for a in message.attachments
         if (a.content_type or "").startswith("image/")
         or a.filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
-    ]
-    ordered: dict[str, int] = {}
+    ][:8]  # cap to avoid oversized requests
+    text = message.content.strip()
 
+    # Ignore plain chatter: only treat as an order if there's an image, or the text
+    # actually contains a quantity (a digit). This stops the bot reacting to talk.
+    if not images and not any(c.isdigit() for c in text):
+        return
+
+    ordered: dict[str, int] = {}
     async with message.channel.typing():
-        # Text part of the order.
-        text = message.content.strip()
         if text:
             try:
                 for n, q in (await parse_order_text(text)).items():
@@ -629,7 +696,10 @@ async def handle_order(message: discord.Message):
                 print(f"[order image error] {e}", flush=True)
 
     if not ordered:
-        await message.add_reaction("❓")
+        try:
+            await message.add_reaction("❓")
+        except Exception:  # noqa: BLE001
+            pass
         return
 
     async with _lock:
@@ -645,7 +715,7 @@ async def handle_order(message: discord.Message):
         left = remaining.get(n, 0)
         flag = "  ⚠️ **OUT**" if left <= 0 else (f"  ⚠️ low" if left <= 10 else "")
         lines.append(f"{item_emoji(n)} {n} −{q}  →  {left} left{flag}")
-    await message.reply("🧾 **Order logged. Stock updated:**\n" + "\n".join(lines))
+    await reply_long(message, "🧾 **Order logged. Stock updated:**\n" + "\n".join(lines))
 
 
 def _norm_kind(token: str) -> str:
@@ -704,7 +774,8 @@ async def handle_command(message: discord.Message, content: str):
             await message.reply(f"No inventory tracked for **{target}** yet.")
             return
         label = "stock" if kind == "store" else "account"
-        await message.reply(
+        await reply_long(
+            message,
             f"**{target}** — {label}:\n{fmt_inventory(user.get(kind, {}))}"
         )
         return
@@ -715,13 +786,14 @@ async def handle_command(message: discord.Message, content: str):
         stock = effective_stock(data)
         sold = sum(data.get("deductions", {}).values())
         note = f"\n_({sold} items sold since last recount — `!sold` for details)_" if sold else ""
-        await message.reply(
+        await reply_long(
+            message,
             f"**📦 Total stock (everyone combined):**\n{fmt_inventory(stock)}{note}"
         )
         return
 
     if cmd == "!summary":
-        await message.reply(build_summary(_load()))
+        await reply_long(message, build_summary(_load()))
         return
 
     if cmd == "!sold":
@@ -731,7 +803,8 @@ async def handle_command(message: discord.Message, content: str):
         if not ded:
             await message.reply("No orders logged since the last recount.")
         else:
-            await message.reply(
+            await reply_long(
+                message,
                 "🧾 **Sold since last recount:**\n" + fmt_inventory(ded)
             )
         return
@@ -786,15 +859,13 @@ async def handle_command(message: discord.Message, content: str):
         except ValueError:
             threshold = 10
         data = _load()
-        agg: dict[str, int] = {}
-        for user in data["users"].values():
-            for name, qty in user.get("store", {}).items():
-                agg[name] = agg.get(name, 0) + qty
-        low = {n: q for n, q in agg.items() if q <= threshold}
+        stock = effective_stock(data)
+        low = {n: q for n, q in stock.items() if q <= threshold}
         if not low:
             await message.reply(f"✅ Nothing at or below {threshold} in stock.")
         else:
-            await message.reply(
+            await reply_long(
+                message,
                 f"⚠️ **Low stock (≤ {threshold}):**\n{fmt_inventory(low)}"
             )
         return
@@ -810,11 +881,12 @@ async def handle_command(message: discord.Message, content: str):
             for kind in VALID_KINDS:
                 for name, qty in user.get(kind, {}).items():
                     if query in name:
-                        hits.append(f"• {uname} ({kind}): {name} — {qty}")
+                        label = "stock" if kind == "store" else "account"
+                        hits.append(f"{item_emoji(name)} {uname} ({label}): {name} — **{qty}**")
         if not hits:
             await message.reply(f"Nobody has anything matching **{query}**.")
         else:
-            await message.reply(f"**Holders of '{query}':**\n" + "\n".join(hits))
+            await reply_long(message, f"**Holders of '{query}':**\n" + "\n".join(hits))
         return
 
     if cmd == "!set":
