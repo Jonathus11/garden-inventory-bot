@@ -42,8 +42,8 @@ from dotenv import load_dotenv
 # ---------------------------------------------------------------------------
 load_dotenv()
 
-DISCORD_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+DISCORD_TOKEN = (os.getenv("DISCORD_BOT_TOKEN") or "").strip()
+ANTHROPIC_API_KEY = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
 VISION_MODEL = os.getenv("VISION_MODEL", "claude-sonnet-5")
 
 if not DISCORD_TOKEN:
@@ -238,7 +238,8 @@ async def on_message(message: discord.Message):
             try:
                 items = await read_inventory_from_image(data, media_type)
             except Exception as exc:  # noqa: BLE001
-                # Walk the exception chain to expose the real network cause.
+                # Log full detail to the private server logs only. NEVER echo raw
+                # error text to Discord — it can contain secrets like API keys.
                 cause_bits = []
                 cur = exc
                 seen = 0
@@ -246,9 +247,11 @@ async def on_message(message: discord.Message):
                     cause_bits.append(f"{type(cur).__name__}: {cur}")
                     cur = cur.__cause__ or cur.__context__
                     seen += 1
-                detail = " <- ".join(cause_bits)
-                print(f"[vision error] {detail}", flush=True)
-                await message.reply(f"⚠️ Vision failed. Root cause: {detail}")
+                print(f"[vision error] {' <- '.join(cause_bits)}", flush=True)
+                await message.reply(
+                    f"⚠️ Couldn't read that image ({type(exc).__name__}). "
+                    "The admin can check the server logs for details."
+                )
                 continue
             for name, qty in items.items():
                 added_total[name] = added_total.get(name, 0) + qty
