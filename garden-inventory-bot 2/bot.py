@@ -114,19 +114,27 @@ def normalize_item(name: str) -> str:
 # Vision: read an inventory screenshot into {item: qty}
 # ---------------------------------------------------------------------------
 VISION_PROMPT = (
-    "This is a screenshot from the game 'Grow a Garden 2'. It shows an inventory "
-    "of items (seeds, pets, gear, sprinklers, blooms, etc.), each usually with a "
-    "quantity number (often shown as xN, Nx, or a small count badge). "
-    "Read every item you can see and return STRICT JSON only, no prose, in the form:\n"
-    '{"items": [{"name": "dragon breath", "qty": 40}, {"name": "moon bloom", "qty": 50}]}\n'
+    "This is a screenshot from the Roblox game 'Grow a Garden 2'. Extract two things "
+    "and return STRICT JSON only, no prose:\n"
+    "1. The current PLAYER'S OWN username. There is a leaderboard panel (usually "
+    "top-right, headed 'People' / 'Sheckles'). The current player's row is highlighted "
+    "— brighter/whiter than the others. Return that username. If a leaderboard row's "
+    "Sheckles number matches the coin count shown at the bottom-left of the screen, "
+    "that row is the current player. If you truly cannot tell, return \"\".\n"
+    "2. The inventory items with quantities. Items appear in inventory panels and in the "
+    "hotbar/quickbar along the bottom (slots numbered 1-6). IMPORTANT: count each hotbar "
+    "slot separately — if the same item (e.g. 'Black Dragon') fills 4 separate slots, "
+    "that is a quantity of 4. If an item shows a stack number (xN), use that number.\n"
+    "Return exactly this shape:\n"
+    '{"username": "StashlySpecial", "items": [{"name": "black dragon", "qty": 4}]}\n'
     "Rules: lowercase item names; if a quantity is unreadable use 1; ignore currency, "
     "coins, sheckles, UI buttons, and the default tools (shovel, build/hammer, trowel, "
     "basket); do not invent items you cannot see."
 )
 
 
-async def read_inventory_from_image(image_bytes: bytes, media_type: str) -> dict:
-    """Return {normalized_item: qty}. Runs the blocking SDK call in a thread."""
+async def read_inventory_from_image(image_bytes: bytes, media_type: str):
+    """Return (in_game_username or "", {normalized_item: qty}). Blocking call in a thread."""
     b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
 
     def _call():
@@ -157,11 +165,13 @@ async def read_inventory_from_image(image_bytes: bytes, media_type: str) -> dict
     # Pull the first {...} JSON object out of the response defensively.
     match = re.search(r"\{.*\}", text, re.DOTALL)
     if not match:
-        return {}
+        return "", {}
     try:
         parsed = json.loads(match.group(0))
     except json.JSONDecodeError:
-        return {}
+        return "", {}
+
+    username = str(parsed.get("username", "") or "").strip()
 
     result: dict[str, int] = {}
     for entry in parsed.get("items", []):
@@ -173,7 +183,7 @@ async def read_inventory_from_image(image_bytes: bytes, media_type: str) -> dict
         except (TypeError, ValueError):
             qty = 1
         result[name] = result.get(name, 0) + max(qty, 0)
-    return result
+    return username, result
 
 
 # ---------------------------------------------------------------------------
@@ -226,17 +236,17 @@ async def on_message(message: discord.Message):
         return
 
     kind = detect_kind(content)
-    username = message.author.display_name
 
     async with message.channel.typing():
         added_total: dict[str, int] = {}
+        game_username = ""
         for att in images:
             data = await att.read()
             media_type = att.content_type or "image/png"
             if media_type not in ("image/png", "image/jpeg", "image/webp", "image/gif"):
                 media_type = "image/png"
             try:
-                items = await read_inventory_from_image(data, media_type)
+                uname, items = await read_inventory_from_image(data, media_type)
             except Exception as exc:  # noqa: BLE001
                 # Log full detail to the private server logs only. NEVER echo raw
                 # error text to Discord — it can contain secrets like API keys.
@@ -253,6 +263,8 @@ async def on_message(message: discord.Message):
                     "The admin can check the server logs for details."
                 )
                 continue
+            if uname and not game_username:
+                game_username = uname
             for name, qty in items.items():
                 added_total[name] = added_total.get(name, 0) + qty
 
@@ -263,6 +275,14 @@ async def on_message(message: discord.Message):
         )
         return
 
+    # Track under the in-game username read from the leaderboard. Fall back to the
+    # Discord poster's name only if vision couldn't find one.
+    username = game_username or message.author.display_name
+    from_note = "" if game_username else (
+        "\n_(couldn't read the in-game name off the leaderboard — filed under your "
+        "Discord name. Use `!set` or include a clearer leaderboard next time.)_"
+    )
+
     async with _lock:
         data = _load()
         bucket = _user_bucket(data, username, kind)
@@ -272,7 +292,8 @@ async def on_message(message: discord.Message):
 
     summary = fmt_inventory(added_total)
     await message.reply(
-        f"✅ Added to **{username}**'s **{kind}** inventory:\n{summary}"
+        f"✅ Added to **{username}**'s **{kind}** inventory "
+        f"(posted by {message.author.display_name}):\n{summary}{from_note}"
     )
 
 
