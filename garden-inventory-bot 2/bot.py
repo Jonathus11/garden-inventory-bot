@@ -57,6 +57,13 @@ if not ANTHROPIC_API_KEY:
 DATA_FILE = Path(os.getenv("INVENTORY_PATH") or Path(__file__).with_name("inventory.json"))
 VALID_KINDS = ("account", "store")
 
+# Default game tools every player always has — never track these as inventory.
+# Add more via the IGNORE_ITEMS env var (comma-separated), e.g. "shovel,build,basket".
+_DEFAULT_IGNORE = {"shovel", "build", "hammer", "trowel", "basket", "wrench"}
+IGNORE_ITEMS = _DEFAULT_IGNORE | {
+    i.strip().lower() for i in os.getenv("IGNORE_ITEMS", "").split(",") if i.strip()
+}
+
 anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ---------------------------------------------------------------------------
@@ -107,7 +114,8 @@ VISION_PROMPT = (
     "Read every item you can see and return STRICT JSON only, no prose, in the form:\n"
     '{"items": [{"name": "dragon breath", "qty": 40}, {"name": "moon bloom", "qty": 50}]}\n'
     "Rules: lowercase item names; if a quantity is unreadable use 1; ignore currency, "
-    "coins, and UI buttons; do not invent items you cannot see."
+    "coins, sheckles, UI buttons, and the default tools (shovel, build/hammer, trowel, "
+    "basket); do not invent items you cannot see."
 )
 
 
@@ -152,7 +160,7 @@ async def read_inventory_from_image(image_bytes: bytes, media_type: str) -> dict
     result: dict[str, int] = {}
     for entry in parsed.get("items", []):
         name = normalize_item(str(entry.get("name", "")))
-        if not name:
+        if not name or name in IGNORE_ITEMS:
             continue
         try:
             qty = int(entry.get("qty", 1))
