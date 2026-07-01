@@ -161,17 +161,22 @@ def _parse_items_json(text: str):
 # Vision: read an inventory screenshot into {item: qty}
 # ---------------------------------------------------------------------------
 VISION_PROMPT = (
-    "This is a screenshot from the Roblox game 'Grow a Garden 2'. Extract two things "
-    "and return STRICT JSON only, no prose:\n"
-    "1. The current PLAYER'S OWN username. There is a leaderboard panel (usually "
-    "top-right, headed 'People' / 'Sheckles'). The current player's row is highlighted "
-    "— brighter/whiter than the others. Return that username. If a leaderboard row's "
-    "Sheckles number matches the coin count shown at the bottom-left of the screen, "
-    "that row is the current player. If you truly cannot tell, return \"\".\n"
-    "2. The inventory items with quantities. Items appear in inventory panels and in the "
-    "hotbar/quickbar along the bottom (slots numbered 1-6). IMPORTANT: count each hotbar "
-    "slot separately — if the same item (e.g. 'Black Dragon') fills 4 separate slots, "
-    "that is a quantity of 4. If an item shows a stack number (xN), use that number.\n"
+    "These are one or MORE screenshots of the SAME player's inventory in the Roblox game "
+    "'Grow a Garden 2' (they may be different tabs like Crops/Gears/Pets, or scrolled views "
+    "of the same list). Combine them into ONE complete inventory and return STRICT JSON "
+    "only, no prose:\n"
+    "1. The current PLAYER'S OWN username. There is a leaderboard panel (usually top-right, "
+    "headed 'People' / 'Sheckles'), and the inventory panel title often reads \"<name>'s "
+    "Inventory\". The current player's leaderboard row is highlighted (brighter/whiter). "
+    "Return that username; if you truly cannot tell, return \"\".\n"
+    "2. The combined inventory items with quantities. Items appear in inventory panels and "
+    "in the hotbar along the bottom. Counting rules:\n"
+    "   • If an item shows a stack number (xN), use that number.\n"
+    "   • If the same stack-number item appears in more than one screenshot (e.g. the "
+    "hotbar is visible in several), count it ONCE — do not add the duplicates.\n"
+    "   • Items shown as individual icons without a number (like pets) count as 1 each; "
+    "count every distinct icon across all screenshots.\n"
+    "   • For the hotbar, count each separate slot.\n"
     "Return exactly this shape:\n"
     '{"username": "StashlySpecial", "items": [{"name": "black dragon", "qty": 4}]}\n'
     "Rules: lowercase item names; if a quantity is unreadable use 1; ignore currency, "
@@ -180,30 +185,26 @@ VISION_PROMPT = (
 )
 
 
-async def read_inventory_from_image(image_bytes: bytes, media_type: str):
-    """Return (in_game_username or "", {normalized_item: qty}). Blocking call in a thread."""
-    b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+async def read_inventory_from_images(images: list):
+    """images: list of (bytes, media_type). Sends them together so the model can
+    merge tabs/scrolls into ONE inventory. Returns (username, {item: qty})."""
+    content = []
+    for raw, mt in images:
+        content.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": mt,
+                "data": base64.standard_b64encode(raw).decode("utf-8"),
+            },
+        })
+    content.append({"type": "text", "text": VISION_PROMPT})
 
     def _call():
         return anthropic_client.messages.create(
             model=VISION_MODEL,
             max_tokens=8000,  # full inventories can have many items — don't truncate
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": b64,
-                            },
-                        },
-                        {"type": "text", "text": VISION_PROMPT},
-                    ],
-                }
-            ],
+            messages=[{"role": "user", "content": content}],
         )
 
     resp = await asyncio.to_thread(_call)
@@ -515,35 +516,33 @@ async def on_message(message: discord.Message):
     kind = detect_kind(content)
 
     async with message.channel.typing():
-        added_total: dict[str, int] = {}
-        game_username = ""
+        # Read every attached screenshot, then send them to the model TOGETHER so it
+        # merges tabs/scrolls into one inventory (and de-dupes overlapping items).
+        payload = []
         for att in images:
-            data = await att.read()
-            media_type = att.content_type or "image/png"
-            if media_type not in ("image/png", "image/jpeg", "image/webp", "image/gif"):
-                media_type = "image/png"
-            try:
-                uname, items = await read_inventory_from_image(data, media_type)
-            except Exception as exc:  # noqa: BLE001
-                # Log full detail to the private server logs only. NEVER echo raw
-                # error text to Discord — it can contain secrets like API keys.
-                cause_bits = []
-                cur = exc
-                seen = 0
-                while cur is not None and seen < 5:
-                    cause_bits.append(f"{type(cur).__name__}: {cur}")
-                    cur = cur.__cause__ or cur.__context__
-                    seen += 1
-                print(f"[vision error] {' <- '.join(cause_bits)}", flush=True)
-                await message.reply(
-                    f"⚠️ Couldn't read that image ({type(exc).__name__}). "
-                    "The admin can check the server logs for details."
-                )
-                continue
-            if uname and not game_username:
-                game_username = uname
-            for name, qty in items.items():
-                added_total[name] = added_total.get(name, 0) + qty
+            raw = await att.read()
+            mt = att.content_type or "image/png"
+            if mt not in ("image/png", "image/jpeg", "image/webp", "image/gif"):
+                mt = "image/png"
+            payload.append((raw, mt))
+        try:
+            game_username, added_total = await read_inventory_from_images(payload)
+        except Exception as exc:  # noqa: BLE001
+            # Log full detail to the private server logs only. NEVER echo raw error
+            # text to Discord — it can contain secrets like API keys.
+            cause_bits = []
+            cur = exc
+            seen = 0
+            while cur is not None and seen < 5:
+                cause_bits.append(f"{type(cur).__name__}: {cur}")
+                cur = cur.__cause__ or cur.__context__
+                seen += 1
+            print(f"[vision error] {' <- '.join(cause_bits)}", flush=True)
+            await message.reply(
+                f"⚠️ Couldn't read those images ({type(exc).__name__}). "
+                "The admin can check the server logs for details."
+            )
+            return
 
     if not added_total:
         await message.reply(
@@ -551,6 +550,9 @@ async def on_message(message: discord.Message):
             "Try a clearer/cropped image, or use `!set` to add items manually."
         )
         return
+
+    plural = "screenshots" if len(images) > 1 else "screenshot"
+    read_note = f" _(combined {len(images)} {plural})_" if len(images) > 1 else ""
 
     # Track under the in-game username read from the leaderboard. Fall back to the
     # Discord poster's name only if vision couldn't find one.
@@ -569,7 +571,7 @@ async def on_message(message: discord.Message):
 
     summary = fmt_inventory(added_total)
     await message.reply(
-        f"✅ Added to **{username}**'s **{kind}** inventory "
+        f"✅ Added to **{username}**'s **{kind}** inventory{read_note} "
         f"(posted by {message.author.display_name}):\n{summary}{from_note}"
     )
 
@@ -593,14 +595,15 @@ async def handle_order(message: discord.Message):
                     ordered[n] = ordered.get(n, 0) + q
             except Exception as e:  # noqa: BLE001
                 print(f"[order text error] {e}", flush=True)
-        # Image part(s) of the order.
+        # Image part(s) of the order — read each separately (each screenshot is its
+        # own order, so quantities add up rather than being de-duped).
         for att in images:
             raw = await att.read()
             mt = att.content_type or "image/png"
             if mt not in ("image/png", "image/jpeg", "image/webp", "image/gif"):
                 mt = "image/png"
             try:
-                _u, items = await read_inventory_from_image(raw, mt)
+                _u, items = await read_inventory_from_images([(raw, mt)])
                 for n, q in items.items():
                     ordered[n] = ordered.get(n, 0) + q
             except Exception as e:  # noqa: BLE001
