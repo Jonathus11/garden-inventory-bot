@@ -238,10 +238,17 @@ async def on_message(message: discord.Message):
             try:
                 items = await read_inventory_from_image(data, media_type)
             except Exception as exc:  # noqa: BLE001
-                await message.reply(
-                    f"⚠️ Couldn't read that image ({type(exc).__name__}): {exc}. "
-                    "It'll retry automatically next time — try posting again."
-                )
+                # Walk the exception chain to expose the real network cause.
+                cause_bits = []
+                cur = exc
+                seen = 0
+                while cur is not None and seen < 5:
+                    cause_bits.append(f"{type(cur).__name__}: {cur}")
+                    cur = cur.__cause__ or cur.__context__
+                    seen += 1
+                detail = " <- ".join(cause_bits)
+                print(f"[vision error] {detail}", flush=True)
+                await message.reply(f"⚠️ Vision failed. Root cause: {detail}")
                 continue
             for name, qty in items.items():
                 added_total[name] = added_total.get(name, 0) + qty
