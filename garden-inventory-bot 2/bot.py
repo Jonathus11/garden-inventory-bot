@@ -62,6 +62,14 @@ try:
 except ValueError:
     ORDERS_CHANNEL_ID = 0
 
+# The bot only listens in the inventory channel. By default it matches any channel
+# whose name contains "inventory" (e.g. #inventory-tracker). To pin it to one exact
+# channel, set INVENTORY_CHANNEL_ID (right-click channel -> Copy Channel ID).
+try:
+    INVENTORY_CHANNEL_ID = int(os.getenv("INVENTORY_CHANNEL_ID", "0") or "0")
+except ValueError:
+    INVENTORY_CHANNEL_ID = 0
+
 # Daily stock summary: where to post it, what hour (UTC, 0-23), and the low threshold.
 try:
     SUMMARY_CHANNEL_ID = int(os.getenv("SUMMARY_CHANNEL_ID", "0") or "0")
@@ -552,12 +560,32 @@ async def on_ready():
     print("Ready. Post an inventory screenshot to track it.")
 
 
+def _is_inventory_channel(message) -> bool:
+    """The bot only acts in the inventory channel: an exact ID if configured,
+    otherwise any channel whose name contains 'inventory'."""
+    if INVENTORY_CHANNEL_ID:
+        return message.channel.id == INVENTORY_CHANNEL_ID
+    name = (getattr(message.channel, "name", "") or "").lower()
+    return "inventory" in name
+
+
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
         return
 
     content = message.content.strip()
+
+    # --- Fulfilled orders -> deduct from stock (staff only, orders channel) ---
+    if ORDERS_CHANNEL_ID and message.channel.id == ORDERS_CHANNEL_ID:
+        if is_admin(message):
+            await handle_order(message)
+        return
+
+    # Ignore EVERYTHING outside the inventory channel so the bot never chats in
+    # other channels (e.g. #creators, #welcome).
+    if not _is_inventory_channel(message):
+        return
 
     # --- Commands -----------------------------------------------------------
     if content.startswith("!"):
@@ -568,12 +596,6 @@ async def on_message(message: discord.Message):
             await message.reply("🔒 Only admins/staff can use the inventory bot.")
             return
         await handle_command(message, content)
-        return
-
-    # --- Fulfilled orders -> deduct from stock (staff only) -----------------
-    if ORDERS_CHANNEL_ID and message.channel.id == ORDERS_CHANNEL_ID:
-        if is_admin(message):
-            await handle_order(message)
         return
 
     # --- Image posts --------------------------------------------------------
