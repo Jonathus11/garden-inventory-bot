@@ -306,11 +306,13 @@ async def parse_order_text(text: str) -> dict:
 
 
 def effective_stock(data: dict) -> dict:
-    """Total store stock across all accounts, minus fulfilled-order deductions."""
+    """Total sellable stock = everything every account holds (both the account and
+    store buckets), minus fulfilled-order deductions."""
     agg: dict[str, int] = {}
     for user in data["users"].values():
-        for name, qty in user.get("store", {}).items():
-            agg[name] = agg.get(name, 0) + qty
+        for bucket in ("account", "store"):
+            for name, qty in user.get(bucket, {}).items():
+                agg[name] = agg.get(name, 0) + qty
     for name, qty in data.get("deductions", {}).items():
         agg[name] = agg.get(name, 0) - qty
     return {n: max(v, 0) for n, v in agg.items()}
@@ -840,18 +842,19 @@ async def handle_command(message: discord.Message, content: str):
         return
 
     if cmd in ("!recount", "!resetstock"):
-        # Start a fresh inventory check: wipe all stock snapshots + the sold ledger,
-        # so the next round of stock screenshots becomes the new source of truth.
+        # Start a fresh inventory check: wipe all holdings + the sold ledger, so the
+        # next round of screenshots becomes the new source of truth.
         async with _lock:
             data = _load()
             for user in data["users"].values():
+                user["account"] = {}
                 user["store"] = {}
             data["deductions"] = {}
             _save(data)
         await message.reply(
-            "🔄 **Stock reset for a fresh inventory check.** Sold-counter zeroed and all "
-            "stock cleared. Now re-post each account's stock screenshots (include the word "
-            "`stock`), and orders will deduct from the new totals."
+            "🔄 **Reset for a fresh inventory check.** Sold-counter zeroed and all "
+            "holdings cleared. Now re-post each account's inventory screenshots and "
+            "orders will deduct from the new totals."
         )
         return
 
