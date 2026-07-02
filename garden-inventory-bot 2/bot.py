@@ -127,10 +127,21 @@ def _load() -> dict:
 
 
 def _save(data: dict) -> None:
-    # Write atomically so a crash/concurrent read can never see a half-written file.
-    tmp = DATA_FILE.with_suffix(DATA_FILE.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True))
-    os.replace(tmp, DATA_FILE)
+    # Make sure the target directory exists (e.g. /data when a volume path is set
+    # but the volume isn't mounted yet) so a save can never crash the handler.
+    try:
+        DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+    payload = json.dumps(data, indent=2, sort_keys=True)
+    tmp = DATA_FILE.parent / (DATA_FILE.name + ".tmp")
+    try:
+        # Write atomically so a crash/concurrent read can't see a half-written file.
+        tmp.write_text(payload)
+        os.replace(tmp, DATA_FILE)
+    except Exception:  # noqa: BLE001
+        # Fall back to a plain write if atomic replace isn't possible on this fs.
+        DATA_FILE.write_text(payload)
 
 
 def _user_bucket(data: dict, username: str, kind: str) -> dict:
@@ -654,12 +665,20 @@ async def on_message(message: discord.Message):
         "Discord name. Use `!set` or include a clearer leaderboard next time.)_"
     )
 
-    async with _lock:
-        data = _load()
-        bucket = _user_bucket(data, username, kind)
-        for name, qty in added_total.items():
-            bucket[name] = bucket.get(name, 0) + qty
-        _save(data)
+    try:
+        async with _lock:
+            data = _load()
+            bucket = _user_bucket(data, username, kind)
+            for name, qty in added_total.items():
+                bucket[name] = bucket.get(name, 0) + qty
+            _save(data)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[save error] {type(exc).__name__}: {exc}", flush=True)
+        await message.reply(
+            f"⚠️ I read the items but couldn't save them ({type(exc).__name__}). "
+            "The admin should check the storage volume / INVENTORY_PATH setting."
+        )
+        return
 
     summary = fmt_inventory(added_total)
     await reply_long(
